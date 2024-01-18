@@ -24,6 +24,7 @@ const CONVERGE = "CONVERGE"
 const PREPARE = "PREPARE"
 const COMMIT = "COMMIT"
 const DECIDE = "DECIDE"
+const TERMINATED = "TERMINATED"
 
 const DOMAIN_SEPARATION_TAG = "GPBFT"
 
@@ -105,8 +106,6 @@ type instance struct {
 	acceptable ECChain
 	// Decision state. Collects DECIDE messages until a decision can be made, independently of protocol phases/rounds.
 	decision *quorumState
-	// Flag set when the participant sends a DECIDE message. Used to send it only once.
-	decideSent bool
 }
 
 func newInstance(
@@ -141,7 +140,6 @@ func newInstance(
 		},
 		acceptable: input,
 		decision:   newQuorumState(powerTable),
-		decideSent: false,
 	}
 }
 
@@ -170,7 +168,7 @@ func (i *instance) receiveAcceptable(chain ECChain) {
 }
 
 func (i *instance) Receive(msg *GMessage) {
-	if i.decided() {
+	if i.terminated() {
 		panic("received message after decision")
 	}
 	if len(i.inbox) > 0 {
@@ -225,6 +223,10 @@ func (i *instance) tryPendingMessages() {
 
 // Processes a single message.
 func (i *instance) receiveOne(msg *GMessage) {
+	if i.phase == TERMINATED {
+		return // No-op
+	}
+
 	// Drop any messages that can never be valid.
 	if !i.isValid(msg) {
 		i.log("dropping invalid %s", msg)
@@ -261,11 +263,8 @@ func (i *instance) receiveOne(msg *GMessage) {
 	// Try to complete the current phase.
 	// Every COMMIT phase stays open to new messages even after the protocol moves on to
 	// a new round. Late-arriving COMMITS can still (must) cause a local decision, *in that round*.
-	// DECIDE messages are also independent of current phase or round.
-	if msg.Step == COMMIT {
+	if msg.Step == COMMIT && i.phase != DECIDE {
 		i.tryCommit(msg.Round)
-	} else if msg.Step == DECIDE {
-		i.tryDecide(msg.Value)
 	} else {
 		i.tryCompletePhase()
 	}
@@ -284,7 +283,9 @@ func (i *instance) tryCompletePhase() {
 	case COMMIT:
 		i.tryCommit(i.round)
 	case DECIDE:
-		// No-op
+		i.tryDecide()
+	case TERMINATED:
+		return // No-op
 	default:
 		panic(fmt.Sprintf("unexpected phase %s", i.phase))
 	}
@@ -329,6 +330,9 @@ func (i *instance) isJustified(msg *GMessage) bool {
 		// COMMIT for bottom is always justified.
 		round := i.roundState(msg.Round)
 		return msg.Value.IsZero() || round.prepared.HasStrongQuorumAgreement(msg.Value.HeadCIDOrZero())
+	} else if msg.Step == DECIDE {
+		// DECIDE needs no justification
+		return !msg.Value.IsZero()
 	}
 	return false
 }
@@ -338,7 +342,7 @@ func (i *instance) beginQuality() {
 	// Broadcast input value and wait up to Δ to receive from others.
 	i.phase = QUALITY
 	i.phaseTimeout = i.alarmAfterSynchrony(QUALITY)
-	i.broadcast(QUALITY, i.input, nil)
+	i.broadcast(i.round, QUALITY, i.input, nil)
 }
 
 // Attempts to end the QUALITY phase and begin PREPARE based on current state.
@@ -370,7 +374,7 @@ func (i *instance) beginConverge() {
 	i.phase = CONVERGE
 	ticket := i.vrf.MakeTicket(i.beacon, i.instanceID, i.round, i.participantID)
 	i.phaseTimeout = i.alarmAfterSynchrony(CONVERGE)
-	i.broadcast(CONVERGE, i.proposal, ticket)
+	i.broadcast(i.round, CONVERGE, i.proposal, ticket)
 }
 
 // Attempts to end the CONVERGE phase and begin PREPARE based on current state.
@@ -406,7 +410,7 @@ func (i *instance) beginPrepare() {
 	// Broadcast preparation of value and wait for everyone to respond.
 	i.phase = PREPARE
 	i.phaseTimeout = i.alarmAfterSynchrony(PREPARE)
-	i.broadcast(PREPARE, i.value, nil)
+	i.broadcast(i.round, PREPARE, i.value, nil)
 }
 
 // Attempts to end the PREPARE phase and begin COMMIT based on current state.
@@ -435,7 +439,7 @@ func (i *instance) tryPrepare() {
 func (i *instance) beginCommit() {
 	i.phase = COMMIT
 	i.phaseTimeout = i.alarmAfterSynchrony(PREPARE)
-	i.broadcast(COMMIT, i.value, nil)
+	i.broadcast(i.round, COMMIT, i.value, nil)
 }
 
 func (i *instance) tryCommit(round uint32) {
@@ -446,11 +450,11 @@ func (i *instance) tryCommit(round uint32) {
 	foundQuorum := committed.ListStrongQuorumAgreedValues()
 	timeoutExpired := i.host.Time() >= i.phaseTimeout
 
-	if len(foundQuorum) > 0 && !foundQuorum[0].IsZero() && !i.decideSent {
+	if len(foundQuorum) > 0 && !foundQuorum[0].IsZero() {
 		// A participant may be forced to decide a value that's not its preferred chain.
 		// The participant isn't influencing that decision against their interest, just accepting it.
-		i.decideSent = true
-		i.broadcast(DECIDE, foundQuorum[0], nil)
+		i.value = foundQuorum[0]
+		i.beginDecide()
 	} else if i.round == round && i.phase == COMMIT && timeoutExpired && committed.ReceivedFromStrongQuorum() {
 		// Adopt any non-empty value committed by another participant (there can only be one).
 		// This node has observed the strong quorum of PREPARE messages that justify it,
@@ -472,22 +476,15 @@ func (i *instance) tryCommit(round uint32) {
 	}
 }
 
-func (i *instance) tryDecide(value ECChain) {
-	weakQuorum := i.decision.HasWeakQuorumAgreement(value.HeadCIDOrZero())
-	strongQuorum := i.decision.HasStrongQuorumAgreement(value.HeadCIDOrZero())
+func (i *instance) beginDecide() {
+	i.phase = DECIDE
+	i.broadcast(0, DECIDE, i.value, nil)
+}
 
-	// If a weak quorum of DECIDE messages has been received, at least one correct participant must have sent one
-	// (and there exists a proof of it, albeit not necessarily locally present).
-	// That means that this value must be decided by every correct participant.
-	// Broadcasting a DECIDE message is necessary for liveness if the broadcast primitive is only best-effort broadcast.
-	// If broadcast() implemented reliable broadcast, this step would not be necessary.
-	if weakQuorum && !i.decideSent {
-		i.broadcast(DECIDE, value, nil)
-		i.decideSent = true
-	}
-
-	if strongQuorum {
-		i.decide(value, 0)
+func (i *instance) tryDecide() {
+	foundQuorum := i.decision.ListStrongQuorumAgreedValues()
+	if len(foundQuorum) > 0 {
+		i.terminate(foundQuorum[0], i.round)
 	}
 }
 
@@ -512,22 +509,22 @@ func (i *instance) isAcceptable(c ECChain) bool {
 	return i.acceptable.HasPrefix(c)
 }
 
-func (i *instance) decide(value ECChain, round uint32) {
-	i.log("✅ decided %s in round %d", &i.value, round)
-	i.phase = DECIDE
+func (i *instance) terminate(value ECChain, round uint32) {
+	i.log("✅ terminated %s in round %d", &i.value, round)
+	i.phase = TERMINATED
 	// Round is a parameter since a late COMMIT message can result in a decision for a round prior to the current one.
 	i.round = round
 	i.value = value
 }
 
-func (i *instance) decided() bool {
-	return i.phase == DECIDE
+func (i *instance) terminated() bool {
+	return i.phase == TERMINATED
 }
 
-func (i *instance) broadcast(step string, value ECChain, ticket Ticket) *GMessage {
-	payload := SignaturePayload(i.instanceID, i.round, step, value)
+func (i *instance) broadcast(round uint32, step string, value ECChain, ticket Ticket) *GMessage {
+	payload := SignaturePayload(i.instanceID, round, step, value)
 	signature := i.host.Sign(i.participantID, payload)
-	gmsg := &GMessage{i.participantID, i.instanceID, i.round, step, value, ticket, signature}
+	gmsg := &GMessage{i.participantID, i.instanceID, round, step, value, ticket, signature}
 	i.host.Broadcast(gmsg)
 	i.enqueueInbox(gmsg)
 	return gmsg
